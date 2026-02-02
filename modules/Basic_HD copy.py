@@ -36,18 +36,15 @@ class BasicHD():
         self.datadir = datadir
         self.logdir = logdir
         self.modeldir = modeldir
-        #self.epochs = 20
-        self.epochs = int(self.ARCH.get("train", {}).get("hd_retrain_epochs", 20))
+        self.epochs = 20
         
 
         from dataset.kitti.parser import Parser
-        labels_for_training = self.DATA.get("labels_coarse", self.DATA["labels"])
         self.parser = Parser(root=self.datadir,
                                         train_sequences=self.DATA["split"]["train"],
                                         valid_sequences=self.DATA["split"]["valid"],
                                         test_sequences=None,
-                                        #labels=self.DATA["labels"],
-                                        labels=labels_for_training,
+                                        labels=self.DATA["labels"],
                                         color_map=self.DATA["color_map"],
                                         learning_map=self.DATA["learning_map"],
                                         learning_map_inv=self.DATA["learning_map_inv"],
@@ -57,28 +54,9 @@ class BasicHD():
                                         workers=self.ARCH["train"]["workers"],
                                         gt=True,
                                         shuffle_train=False)
-        
-        # 
-        lmap = self.DATA.get("learning_map", {}) or {}
-        # 只排除负数映射（-1），其余全部保留；不要用 learning_ignore 来过滤
-        tgt = [v for v in lmap.values() if isinstance(v, int) and v >= 0]
-        if not tgt:
-            raise RuntimeError("Cannot infer num_classes from data cfg")
-        self.num_classes = max(tgt) + 1  # 这里会得到 17
-
-
-
-
-
-        print("[DEBUG] num_classes (from learning_map) =", self.num_classes)
-        print("[DEBUG] parser.get_n_classes()          =", self.parser.get_n_classes())
-
-        
-        #self.num_classes = self.parser.get_n_classes() 
+        self.num_classes = self.parser.get_n_classes() 
         epsilon_w = self.ARCH["train"]["epsilon_w"]
-        content = torch.zeros(self.num_classes, dtype=torch.float)
-        #content = torch.zeros(self.parser.get_n_classes(), dtype=torch.float)
-
+        content = torch.zeros(self.parser.get_n_classes(), dtype=torch.float)
         for cl, freq in DATA["content"].items():
             x_cl = self.parser.to_xentropy(cl)  # map actual class to xentropy class
             content[x_cl] += freq
@@ -93,15 +71,12 @@ class BasicHD():
         # self.model = model
         # concatenate the encoder and the head
         self.model = set_model(ARCH, modeldir, 'rp', 0, 0, self.num_classes, self.device)
-        #print(self.parser.get_n_classes())
-        print(self.num_classes)
+        print(self.parser.get_n_classes())
         self.post = None
         if self.ARCH["post"]["KNN"]["use"]:
             self.post = KNN(self.ARCH["post"]["KNN"]["params"],
-                            self.num_classes)
-        #self.parser.get_n_classes())
-        #print(self.parser.get_n_classes())
-        print(self.num_classes)
+                            self.parser.get_n_classes())
+        print(self.parser.get_n_classes())
 
         # GPU?
         self.gpu = False
@@ -121,8 +96,8 @@ class BasicHD():
             if w < 1e-10:
                 self.ignore_class.append(i)
                 print("Ignoring class ", i, " in IoU evaluation")
-        self.evaluator = iouEval(self.num_classes, self.device, self.ignore_class)
-        #self.evaluator = iouEval(self.parser.get_n_classes(),self.device, self.ignore_class)
+        self.evaluator = iouEval(self.parser.get_n_classes(),
+                                 self.device, self.ignore_class)
         for e in range(1, 2):
             time1 = time.time()
             self.train(self.parser.get_train_set(), self.model, self.logger)
@@ -237,11 +212,11 @@ class BasicHD():
                 # print("Check the self.is_wrong_list[i] shape", self.is_wrong_list[i].shape)
                 # assert self.is_wrong_list[i].shape == is_wrong.shape
                 # Initialize if needed — make sure it's a FloatTensor
-                if self.is_wrong_list[i] is None or self.is_wrong_list[i].shape != is_wrong.shape:
-                    self.is_wrong_list[i] = torch.zeros_like(is_wrong, dtype=losses.dtype)
-                self.is_wrong_list[i][is_wrong] = losses
+                # if self.is_wrong_list[i] is None or self.is_wrong_list[i].shape != is_wrong.shape:
+                #     self.is_wrong_list[i] = torch.zeros_like(is_wrong, dtype=losses.dtype)
+                # self.is_wrong_list[i][is_wrong] = losses
                 # print("is_wrong shape: ", is_wrong.shape)
-                # self.is_wrong_list[i] = is_wrong
+                self.is_wrong_list[i] = is_wrong
                 # print(losses.min(), losses.max())
 
 
@@ -252,8 +227,6 @@ class BasicHD():
     
     def retrain(self, train_loader, model, epoch, logger):  # task_list
         """Training of one epoch on single-pass of data"""
-        buffer_percent = 0.05
-        print("Training in ", buffer_percent)
         # Set validation frequency
         batchs_per_class = np.floor(len(train_loader) / self.num_classes).astype('int')
         if self.gpu:
@@ -283,7 +256,7 @@ class BasicHD():
                 start = time.time()
                 model.classify.weight[:] = F.normalize(model.classify_weights)
                 # print("Number of wrongs:", self.is_wrong_list[i].sum().item())
-                predictions, samples_hv, indices, self.is_wrong_list[i] = model(proj_in, self.mask, buffer_percent, self.is_wrong_list[i])
+                predictions, samples_hv, indices, self.is_wrong_list[i] = model(proj_in, self.mask, None, self.is_wrong_list[i])
                 argmax = predictions.argmax(dim=1) # (bsz*size, 1)
                 # #proj_labels shape: torch.Size([1, 64, 512])
                 proj_labels = proj_labels.view(-1)  # shape: (btsz*64*512, 1) 
@@ -326,7 +299,7 @@ class BasicHD():
                 # self.is_wrong_list[i][is_wrong] = losses
                 wrong_indices_within_selected = is_wrong.nonzero(as_tuple=False).squeeze()
                 actual_wrong_indices = indices[wrong_indices_within_selected]
-                self.is_wrong_list[i][actual_wrong_indices] = losses.to(self.is_wrong_list[i].dtype)
+                # self.is_wrong_list[i][actual_wrong_indices] = losses.to(self.is_wrong_list[i].dtype)
                 # print("actual_wrong_indices: ", actual_wrong_indices.shape)
                 # print("wrong_indices_within_selected: ", wrong_indices_within_selected.shape)
                 # print("is_wrong: ", is_wrong.shape)
@@ -334,8 +307,7 @@ class BasicHD():
                 # print("indices: ", indices.shape)
                 # # print("is_wrong_list number of wrong: ", self.is_wrong_list[i].nonzero(as_tuple=False).squeeze().sum().item())
                 # print("Number of wrongs:", self.is_wrong_list[i].sum().item())
-                
-                # self.is_wrong_list[i][actual_wrong_indices] = True
+                self.is_wrong_list[i][actual_wrong_indices] = True
                 # print("is_wrong_list number of wrong: ", self.is_wrong_list[i].nonzero(as_tuple=False).squeeze().sum().item())
                 # print("Number of wrongs:", self.is_wrong_list[i].sum().item())
 
@@ -439,31 +411,23 @@ class BasicHD():
                 # path = os.path.join(self.logdir, "sequences",
                 #                     path_seq, "predictions", path_name)
                 # pred_np.tofile(path)
-        print("Mean HDC validation time:{}\t std:{}".format(np.mean(validation_time), np.std(validation_time)))
+            print("Mean HDC validation time:{}\t std:{}".format(np.mean(validation_time), np.std(validation_time)))
         accuracy = evaluator.getacc()
         jaccard, class_jaccard = evaluator.getIoU()
         acc.update(accuracy.item(), proj_in.size(0))
         iou.update(jaccard.item(), proj_in.size(0))
 
-        time_avg = float(np.mean(validation_time)) if len(validation_time) > 0 else float("nan")
-        time_std = float(np.std(validation_time)) if len(validation_time) > 0 else float("nan")
-
-
         print('Validation set:\n'
-                'Time avg per batch {:.3f} (std {:.3f})\n'
+                'Time avg per batch xxx\n'
                 'Loss avg {loss.avg:.4f}\n'
                 'Jaccard avg {jac.avg:.4f}\n'
                 'WCE avg {wces.avg:.4f}\n'
                 'Acc avg {acc.avg:.3f}\n'
                 'IoU avg {iou.avg:.3f}'.format(
-                        time_avg, time_std, loss=losses, jac=jaccs, wces=wces, acc=acc, iou=iou))
+                                                loss=losses,
+                                                jac=jaccs,
+                                                wces=wces,
+                                                acc=acc, iou=iou))
         
-        # for i, jacc in enumerate(class_jaccard):
-        #         print('IoU class {i:} [{class_str:}] = {jacc:.3f}'.format(
-        #             i=i, class_str=class_func(i), jacc=jacc))
-        #         save_to_log(self.log, 'log.txt', 'IoU class {i:} [{class_str:}] = {jacc:.3f}'.format(
-        #             i=i, class_str=class_func(i), jacc=jacc))
-        #         self.info["valid_classes/" + class_func(i)] = jacc
-
         print('Class Jaccard: ', class_jaccard)
         return iou.avg

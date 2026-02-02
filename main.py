@@ -2,128 +2,141 @@
 # This file is covered by the LICENSE file in the root of this project.
 
 import argparse
-import subprocess
 import datetime
 import yaml
-from shutil import copyfile
 import os
+import sys
 import shutil
 
-if __name__ == '__main__':
-    splits = ["train", "valid", "test"]
-    parser = argparse.ArgumentParser("./infer.py")
-    parser.add_argument(
-        '--dataset', '-d',
-        type=str,
-        required=True,
-        default=None,
-        help='Dataset to train with. No Default',
-    )
-    parser.add_argument(
-        '--log', '-l',
-        type=str,
-        required=True,
-        default=None,
-        help='Directory to put the predictions. Default: ~/logs/date+time'
-    )
-    parser.add_argument(
-        '--model', '-m',
-        type=str,
-        required=True,
-        default=None,
-        help='Directory to get the trained model.'
-    )
-    parser.add_argument(
-        '--train_seq', '-t', 
-        type=str, 
-        required=False,
-        default=None,
-        help='Comma-separated list of training sequences (e.g., "0,1,2")'
-    )
-    FLAGS, unparsed = parser.parse_known_args()
+def _read_yaml(path, kind):
+    try:
+        print(f"Opening {kind} config file from {path}")
+        with open(path, "r") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(e)
+        print(f"Error opening {kind} yaml file: {path}")
+        sys.exit(1)
 
-    # print summary of what we will do
+def _resolve_cfg_paths(flags):
+    """
+    Resolve ARCH/DATA yaml paths by priority:
+    1) CLI: --arch_cfg/--data_cfg
+    2) Model dir: <model>/arch_cfg.yaml and <model>/data_cfg.yaml
+    3) Project defaults: config/arch/senet-512.yml and config/labels/semantic-kitti.yaml
+    """
+    # 1) CLI
+    if flags.arch_cfg and not os.path.isfile(flags.arch_cfg):
+        print(f"[ERROR] --arch_cfg not found: {flags.arch_cfg}")
+        sys.exit(1)
+    if flags.data_cfg and not os.path.isfile(flags.data_cfg):
+        print(f"[ERROR] --data_cfg not found: {flags.data_cfg}")
+        sys.exit(1)
+
+    # 2) Model dir
+    model_arch = os.path.join(flags.model, "arch_cfg.yaml")
+    model_data = os.path.join(flags.model, "data_cfg.yaml")
+
+    # 3) Defaults (project relative)
+    default_arch = "config/arch/senet-512.yml"
+    default_data = "config/labels/semantic-kitti.yaml"  
+
+    arch_path = (
+        flags.arch_cfg
+        if flags.arch_cfg
+        else (model_arch if os.path.isfile(model_arch) else default_arch)
+    )
+    data_path = (
+        flags.data_cfg
+        if flags.data_cfg
+        else (model_data if os.path.isfile(model_data) else default_data)
+    )
+
+
+    if not os.path.isfile(arch_path):
+        print(f"[ERROR] arch cfg not found: {arch_path}")
+        sys.exit(1)
+    if not os.path.isfile(data_path):
+        print(f"[ERROR] data cfg not found: {data_path}")
+        sys.exit(1)
+
+    return arch_path, data_path
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser("Inference entry (main.py)")
+    parser.add_argument('--dataset', '-d', type=str, required=True,
+                        help='Dataset root (SemanticKITTI-style).')
+    parser.add_argument('--log', '-l', type=str, required=True,
+                        help='Directory to put the predictions.')
+    parser.add_argument('--model', '-m', type=str, required=True,
+                        help='Directory or file to get the trained model from.')
+    parser.add_argument('--train_seq', '-t', type=str, default=None,
+                        help='Comma-separated list of sequences for processing (e.g. "5,6" or "61,553").')
+    parser.add_argument('--arch_cfg', '-ac', type=str, default=None,
+                        help='Path to arch yaml. If omitted, try <model>/arch_cfg.yaml, else project default.')
+    parser.add_argument('--data_cfg', '-dc', type=str, default=None,
+                        help='Path to data yaml. If omitted, try <model>/data_cfg.yaml, else project default.')
+
+    FLAGS, _ = parser.parse_known_args()
+
+    
     print("----------")
     print("INTERFACE:")
     print("dataset", FLAGS.dataset)
     print("log", FLAGS.log)
     print("model", FLAGS.model)
+    print("arch_cfg", FLAGS.arch_cfg if FLAGS.arch_cfg else "(auto)")
+    print("data_cfg", FLAGS.data_cfg if FLAGS.data_cfg else "(auto)")
     print("----------\n")
 
-    # open arch config file
-    try:
-        print("Opening arch config file from %s" % FLAGS.model)
-        # ARCH = yaml.safe_load(open(FLAGS.model + "/arch_cfg.yaml", 'r'))
-        ARCH = yaml.safe_load(open("config/arch/senet-512.yml", 'r'))
-    except Exception as e:
-        print(e)
-        print("Error opening arch yaml file.")
-        quit()
-
-    # open data config file
-    try:
-        print("Opening data config file from %s" % FLAGS.model)
-        # DATA = yaml.safe_load(open(FLAGS.model + "/data_cfg.yaml", 'r'))
-        DATA = yaml.safe_load(open("config/labels/semantic-kitti.yaml", 'r'))
-        # DATA = yaml.safe_load(open("config/labels/nuscenes.yaml", 'r'))
-    except Exception as e:
-        print(e)
-        print("Error opening data yaml file.")
-        quit()
-
-    # # create log folder
-    # try:
-    #     if os.path.isdir(FLAGS.log):
-    #         shutil.rmtree(FLAGS.log)
-    #     os.makedirs(FLAGS.log)
-    #     os.makedirs(os.path.join(FLAGS.log, "sequences"))
-    #     for seq in DATA["split"]["train"]:
-    #         seq = '{0:02d}'.format(int(seq))
-    #         print("train", seq)
-    #         os.makedirs(os.path.join(FLAGS.log, "sequences", seq))
-    #         os.makedirs(os.path.join(FLAGS.log, "sequences", seq, "predictions"))
-    #     for seq in DATA["split"]["valid"]:
-    #         seq = '{0:02d}'.format(int(seq))
-    #         print("valid", seq)
-    #         os.makedirs(os.path.join(FLAGS.log, "sequences", seq))
-    #         os.makedirs(os.path.join(FLAGS.log, "sequences", seq, "predictions"))
-    #     for seq in DATA["split"]["test"]:
-    #         seq = '{0:02d}'.format(int(seq))
-    #         print("test", seq)
-    #         os.makedirs(os.path.join(FLAGS.log, "sequences", seq))
-    #         os.makedirs(os.path.join(FLAGS.log, "sequences", seq, "predictions"))
-    # except Exception as e:
-    #     print(e)
-    #     print("Error creating log directory. Check permissions!")
-    #     raise
-
-    # except Exception as e:
-    #     print(e)
-    #     print("Error creating log directory. Check permissions!")
-    #     quit()
-
-    # does model folder exist?
-    if os.path.isdir(FLAGS.model):
-        print("model folder exists! Using model from %s" % (FLAGS.model))
-    else:
-        print("model folder doesnt exist! Can't infer...")
-        quit()
     
+    if not os.path.isdir(FLAGS.model):
+        print(f"[ERROR] model folder doesnt exist: {FLAGS.model}")
+        sys.exit(1)
+    if not os.path.isdir(FLAGS.dataset):
+        print(f"[ERROR] dataset folder doesnt exist: {FLAGS.dataset}")
+        sys.exit(1)
+
+    
+    arch_path, data_path = _resolve_cfg_paths(FLAGS)
+    ARCH = _read_yaml(arch_path, "arch")
+    DATA = _read_yaml(data_path, "data")
+
+  
     if FLAGS.train_seq is not None:
         try:
-            DATA["split"]["train"] = [int(s.strip()) for s in FLAGS.train_seq.split(",")]
-            print(f"[INFO] Overriding training sequences: {DATA['split']['train']}")
+            parsed = [int(s.strip()) for s in FLAGS.train_seq.split(",") if s.strip() != ""]
+            DATA.setdefault("split", {})
+            DATA["split"]["train"] = parsed
+            print(f"[INFO] Overriding sequences: {DATA['split']['train']}")
         except ValueError as e:
             print(f"[ERROR] Failed to parse --train_seq: {e}")
-            exit(1)
+            sys.exit(1)
     else:
-        print("[INFO] Using default training sequences from data config.")
+        print("[INFO] Using default sequences from data config (split.train).")
 
-    from modules.Basic_HD import BasicHD
+
+    try:
+        os.makedirs(FLAGS.log, exist_ok=True)
+    except Exception as e:
+        print(e)
+        print("[ERROR] Error creating log directory. Check permissions!")
+        sys.exit(1)
+
+
+    print(f"[INFO] Start time: {datetime.datetime.now().isoformat()}")
+    print(f"[INFO] Saving predictions to: {FLAGS.log}")
+
+
+    try:
+        from modules.Basic_HD import BasicHD
+    except Exception as e:
+        print(e)
+        print("[ERROR] Cannot import modules.Basic_HD. Check PYTHONPATH and project structure.")
+        sys.exit(1)
+
+    # BasicHD(dataset_cfg, data_cfg, dataset_root, log_dir, model_dir, extra)
     BasicHD = BasicHD(ARCH, DATA, FLAGS.dataset, FLAGS.log, FLAGS.model, None)
     BasicHD.start()
 
-    # from modules.Basic_Conv import BasicConv
-    # BasicConv = BasicConv(ARCH, DATA, FLAGS.dataset, FLAGS.log, FLAGS.model, None)
-    # BasicConv.start()
-
+    print(f"[INFO] Finished at: {datetime.datetime.now().isoformat()}")

@@ -7,6 +7,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def quantize_6bit_signed(x: torch.Tensor, eps: float = 1e-8):
+    """
+    Quantize a float tensor to signed 6-bit in the range [-32, 31].
+
+    Args:
+        x: float tensor.
+        eps: small constant to avoid division by zero.
+
+    Returns:
+        q: int8 tensor with values in [-32, 31].
+        scale: scalar float, so that x_hat ≈ q * scale.
+    """
+    qmin = -32
+    qmax = 31
+
+    # Use symmetric range based on max absolute value
+    alpha = x.abs().max()
+    alpha = torch.clamp(alpha, min=eps)
+
+    # Map [-alpha, alpha] approximately to [-31, 31]
+    scale = alpha / float(qmax)
+
+    # Real quantization: round to integer grid, then clamp to 6-bit range
+    q = torch.round(x / scale)
+    q = torch.clamp(q, qmin, qmax).to(torch.int8)
+
+    return q, scale
+
+
 class Model(nn.Module):
     def __init__(self, ARCH, modeldir, hd_encoder, num_levels, randomness, num_classes, device):
         super(Model, self).__init__()
@@ -112,49 +142,17 @@ class Model(nn.Module):
     def encode(self, x, mask=None, PERCENTAGE=None, is_wrong=None):
         if mask is None:
             mask = torch.ones(self.hd_dim, device=self.device).type(torch.bool)
-        # print("x.shape", x.shape)  # torch.Size([1, 5, 64, 512])
+        # x shape example before backbone: [B, C_in, 64, 512]
 
         with torch.cuda.amp.autocast(enabled=True):
-            x = self.net(x, True)
+            x = self.net(x, True)  # x: [B, 128, 64, 512]
         
-        # print("x.shape", x.shape)  # torch.Size([1, 128, 64, 512])
-        # x = self.flatten(x)
-        x = x.permute(0, 2, 3, 1)  # shape: (1, 64, 512, 128)
-        x = x.reshape(-1, 128)     # shape: (1*64*512, 128) = (32768, 128)
-        # sample_hv = torch.zeros((x.shape[0], self.hd_dim), device=self.device)
-        # print("x.shape", x.shape)  # torch.Size([32768, 128])
+        # Rearrange to [B*H*W, C]
+        x = x.permute(0, 2, 3, 1)  # shape: [B, H, W, C=128]
+        x = x.reshape(-1, 128)     # shape: [B*H*W, 128]
+
         if PERCENTAGE is not None:
-            # # Pick by the wrong and keep the PERCENTAGE
-            # wrong_indices = torch.nonzero(is_wrong, as_tuple=False).squeeze()
-            # num_samples = int(x.shape[0] * PERCENTAGE)  # Calculate the number of samples to select
-            # # selected_indices = torch.randperm(x.shape[0], device=x.device)[:num_samples]
-            # # print("selected_indices", selected_indices.shape)  # e.g., torch.Size([1638])
-            # # print("x", x.shape)  # e.g., torch.Size([1638])
-            # # print("x[selected_indices]", x[selected_indices[0]])  # e.g., torch.Size([1638, 128])
-
-            # # # print("num_samples", num_samples)  # e.g., 32768 * 0.05 = 1638
-            # # # print("wrong_indices", wrong_indices.shape)
-            # # # print("is_wrong", is_wrong.shape)  # e.g., torch.Size([32768])
-
-            # if wrong_indices.numel() >= num_samples:
-            #     # If there are enough wrong samples, randomly select from them
-            #     selected_indices = wrong_indices[torch.randperm(wrong_indices.shape[0], device=x.device)[:num_samples]]
-            #     is_wrong[selected_indices] = False # Mark the selected indices as used
-            # else:
-            #     # If there are not enough wrong samples, fill the rest with random samples
-            #     non_wrong_indices = torch.nonzero(~is_wrong, as_tuple=False).squeeze()
-            #     remaining = num_samples - wrong_indices.numel()
-            #     fill_indices = non_wrong_indices[torch.randperm(non_wrong_indices.shape[0], device=x.device)[:remaining]]
-
-            #     selected_indices = torch.cat([wrong_indices, fill_indices], dim=0)
-            #     is_wrong[selected_indices] = False # Mark the selected indices as used
-
-            # selected_indices, _ = selected_indices.sort()  # Optional: sort to preserve order
-            # # print("selected_indices", selected_indices.shape)  # e.g., torch.Size([1638])
-            # x = x[selected_indices]  # shape: (~PERCENTAGE * 32768, 128)
-            # assert x.shape[0] == num_samples, f"Expected {num_samples} samples, got {x.shape[0]}"
-
-            # Pick by loss: 
+            # Select a subset of positions based on loss information (existing logic)
             num_samples = int(x.shape[0] * PERCENTAGE)
             num_wrongdata = num_samples // 2
             sorted_loss, sorted_indices = torch.sort(is_wrong, descending=True)
@@ -173,42 +171,72 @@ class Model(nn.Module):
                 random_fill_indices = remaining_indices
             
             selected_indices = torch.cat([top_indices, random_fill_indices], dim=0)
-            is_wrong[selected_indices] = 0 # Mark the selected indices as used
+            is_wrong[selected_indices] = 0  # Mark the selected indices as used
 
             # Get top losses and their indices (descending sort)
             sorted_loss, sorted_indices = torch.sort(is_wrong, descending=True)
             selected_indices = sorted_indices[:num_samples]  # pick top N
             is_wrong[selected_indices] = 0.0
 
-            # Filter your data
+            # Filter input features
             x = x[selected_indices]
-            # print("x after selection", x.shape)  # e.g., torch.Size([1638, 128])
-            # print("x", x[0])  # e.g., torch.Size([1638])
-
         else:
-            selected_indices = torch.arange(x.shape[0], device=x.device)  # use all data
+            # Use all positions
+            selected_indices = torch.arange(x.shape[0], device=x.device)
+
+        # Allocate tensor for hypervectors
         sample_hv = torch.zeros((x.shape[0], self.hd_dim), device=self.device, dtype=x.dtype)
 
+        # HD encoding
         if self.hd_encoder == 'rp':
             if x.dtype != self.projection.weight.dtype:
                 self.projection = self.projection.to(x.dtype).to(self.device)
             sample_hv[:, mask] = self.projection(x)[:, mask]
 
         elif self.hd_encoder == 'idlevel':
-            # print("Encode bind value: ", self.value(x)[:, :, mask].shape)  # btz*size x num_features * hd_dim
-            # print("Encode position value: ", self.position.weight[:, mask].shape)  # num_features * hd_dim
-            tmp_hv = functional.bind(self.position.weight[:, mask],
-                                     self.value(x)[:, :, mask])  # bsz*size x num_features x hd_dim
-            sample_hv[:, mask] = functional.multiset(tmp_hv)  # bsz*size x hd_dim
+            tmp_hv = functional.bind(
+                self.position.weight[:, mask],
+                self.value(x)[:, :, mask]
+            )  # shape: [N, num_features, hd_dim]
+            sample_hv[:, mask] = functional.multiset(tmp_hv)  # shape: [N, hd_dim]
 
         elif self.hd_encoder == 'nonlinear':
             sample_hv[:, mask] = self.nonlinear_projection(x)[:, mask]
-        else:  # None encoder, just use the raw sample
+
+        else:  # No encoder, just return the raw samples
             return x
 
+        # Binarize to bipolar hypervectors in {-1, +1}
         sample_hv[:, mask] = functional.hard_quantize(sample_hv[:, mask])
-        # print("sample_hv.shape", sample_hv.shape)  # (bsz*size, 1000)
+        # sample_hv shape example: [B*H*W, hd_dim]
+
+        # ----------------------------------------------------------------------
+        # Compute and quantize frame-averaged hypervector to signed 6-bit
+        # NOTE:
+        #   - We only compute a meaningful frame-level HV when using all samples
+        #     (PERCENTAGE is None). In the retraining case with sampling, the
+        #     average would not represent the full frame, so we skip it.
+        # ----------------------------------------------------------------------
+        if PERCENTAGE is None:
+            # Compute frame-averaged HV over all positions in this batch
+            # If batch size is 1 (typical in this pipeline), this gives [1, hd_dim].
+            frame_avg_hv = sample_hv.mean(dim=0, keepdim=True)  # [1, hd_dim], float in [-1, 1]
+
+            # Real 6-bit quantization in [-32, 31]
+            frame_avg_hv_q, frame_avg_hv_scale = quantize_6bit_signed(frame_avg_hv)
+
+            # De-quantized float representation (what 6-bit hardware can realize)
+            frame_avg_hv_dequant = frame_avg_hv_q.to(sample_hv.dtype) * frame_avg_hv_scale
+
+            # Store for later export / inspection
+            self.last_frame_avg_hv = frame_avg_hv_dequant        # [1, hd_dim], float32/float16
+            self.last_frame_avg_hv_q = frame_avg_hv_q            # [1, hd_dim], int8 in [-32, 31]
+            self.last_frame_avg_hv_scale = frame_avg_hv_scale    # scalar float
+
+        # Return per-position hypervectors for segmentation training/inference
         return sample_hv, selected_indices, is_wrong
+
+
 
     def forward(self, x, mask=None, PERCENTAGE=None, is_wrong=None):
         if mask is None:
@@ -226,12 +254,57 @@ class Model(nn.Module):
 
         return logits, F.normalize(enc), indices, is_wrong_left # enc is still hd_dim, but some elements are 0
 
-    def get_predictions(self, enc):
-        # Compute the cosine distance between normalized hypervectors
-        if enc.dtype != self.classify.weight.dtype:
-            self.classify = self.classify.to(enc.dtype)
-        logits = self.classify(F.normalize(enc))
+    def get_predictions(self, enc, use_quantized: bool = False):
+        """
+        Compute class scores for encoded hypervectors.
+
+        Args:
+            enc: tensor of shape [N, hd_dim], float hypervectors.
+            use_quantized: if True and quantized class weights are available,
+                           use int8 dot-product with 6-bit quantization.
+                           Otherwise fall back to the original float path.
+
+        Returns:
+            logits: tensor of shape [N, num_classes], float scores.
+        """
+        # 1) Fallback: original float path (used during training or if not quantized)
+        if (not use_quantized) or (not hasattr(self, "classify_weights_q")):
+            # Compute cosine-distance-like scores: W * normalize(enc)^T
+            if enc.dtype != self.classify.weight.dtype:
+                self.classify = self.classify.to(enc.dtype)
+            logits = self.classify(F.normalize(enc))
+            return logits
+
+        # 2) Quantized inference path: real 6-bit (int8) dot-product
+        #    We assume class hypervectors have already been quantized by
+        #    BasicHD.quantize_class_hv_6bit(), which sets:
+        #       - self.classify_weights_q: [num_classes, hd_dim], int8 in [-32, 31]
+        #       - self.classify_weights_scale: scalar float
+        w_q = self.classify_weights_q          # int8, [C, D]
+        w_scale = self.classify_weights_scale  # scalar float
+
+        # Normalize the input hypervectors to match the training behavior
+        enc_norm = F.normalize(enc)  # [N, D], float in roughly [-1, 1]
+
+        # Quantize enc_norm to signed 6-bit as well
+        # enc_q: int8 in [-32, 31], enc_scale: scalar float
+        enc_q, enc_scale = quantize_6bit_signed(enc_norm)
+
+        # Compute integer logits: shape [N, C]
+        # Use int32 to avoid overflow when summing products of int8 values.
+        logits_int = torch.matmul(
+            enc_q.to(torch.int32),              # [N, D]
+            w_q.t().to(torch.int32)            # [D, C]
+        )
+
+        # Total real scale factor for dot-product scores
+        full_scale = enc_scale * w_scale  # scalar
+
+        # Convert back to float for the rest of the pipeline
+        logits = logits_int.to(enc.dtype) * full_scale
+
         return logits
+   
 
     def extract_class_hv(self, mask=None):
         if mask is None:

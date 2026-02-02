@@ -124,8 +124,8 @@ class SemanticKitti(Dataset):
     print("sequences: ", self.sequences)
     for seq in self.sequences:
       # to string
-      #seq = '{0:02d}'.format(int(seq))
-      seq = '{0:04d}'.format(int(seq))
+      seq = '{0:02d}'.format(int(seq))
+      # seq = '{0:04d}'.format(int(seq))
 
       print("parsing seq {}".format(seq))
 

@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.so
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Logs / outputs ---
+logs/
+logs_nuscenes/
+**/*.log
+**/*.out
+
+# --- Large data / generated datasets ---
+dense_dataset_semantic/
+nuscenes_kitti/
+
+# --- Pretrained weights / checkpoints ---
+pretrain012347910/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+
+# --- Cache / tracking ---
+.cache/
+wandb/
+runs/
