@@ -329,16 +329,17 @@ class Model(nn.Module):
 
         # Compute integer logits: shape [N, C]
         # Use int32 to avoid overflow when summing products of int8 values.
-        logits_fp = torch.matmul(
-        enc_q.to(torch.float32),          # [N, D]
-        w_q.t().to(torch.float32)         # [D, C]
-    )
+        logits_int = torch.matmul(
+            enc_q.to(torch.int32),           # [N, D]
+            w_q.t().to(torch.int32)         # [D, C]
+        )
 
         # Total real scale factor for dot-product scores
         full_scale = enc_scale * w_scale  # scalar
 
         # Convert back to float for the rest of the pipeline
-        logits = logits_fp.to(enc.dtype) * full_scale
+        logits = logits_int.to(enc.dtype) * full_scale
+
         return logits
 
     # ----------------------------------------------------------------------

@@ -13,34 +13,37 @@ import torch.nn.functional as F
 
 def quantize_signed_nbit(x: torch.Tensor, n_bits: int = 6, eps: float = 1e-8):
     """
-    No-zero symmetric signed n-bit quantization.
+    Quantize a float tensor to signed n-bit with 2's complement style range.
 
-    For n_bits=4 -> q in {-8..-1, +1..+8}  (no 0)
-    For n_bits=6 -> q in {-32..-1, +1..+32} (no 0)
+    For example:
+        n_bits = 6 -> q in [-32, 31]
+        n_bits = 4 -> q in [ -8,  7]
 
-    NOTE: This is not two's-complement 4-bit representable set (since +8 exists),
-          but it's fine since we store in int8 and enforce the range logically.
+    Args:
+        x: float tensor to quantize.
+        n_bits: number of bits (e.g., 4, 6, 8).
+        eps: small constant to avoid division by zero.
+
+    Returns:
+        q: int8 tensor with values in [qmin, qmax].
+        scale: scalar float, so that x_hat ≈ q * scale.
     """
-    assert 2 <= n_bits <= 8, f"n_bits must be in [2,8], got {n_bits}"
+    # Signed range for n-bit 2's complement
+    qmax = (1 << (n_bits - 1)) - 1   # e.g.,  31 for 6-bit, 7 for 4-bit
+    qmin = - (1 << (n_bits - 1))     # e.g., -32 for 6-bit, -8 for 4-bit
 
-    levels = 1 << (n_bits - 1)  # 4->8, 6->32
-    alpha = x.abs().max().clamp_min(eps)
+    # Use symmetric range based on max absolute value
+    alpha = x.abs().max()
+    alpha = torch.clamp(alpha, min=eps)
 
-    # scale maps integer levels back to real values
-    scale = alpha / float(levels)
+    # Map [-alpha, alpha] approximately to [qmin, qmax]
+    scale = alpha / float(qmax)
 
+    # Real quantization: round to integer grid, then clamp to n-bit range
     q = torch.round(x / scale)
-    q = torch.clamp(q, -levels, levels)
+    q = torch.clamp(q, qmin, qmax).to(torch.int8)
 
-    # remove zeros: push 0 to +/-1 according to sign of x (0 treated as +)
-    q = torch.where(
-        q == 0,
-        torch.where(x >= 0, torch.ones_like(q), -torch.ones_like(q)),
-        q
-    )
-
-    return q.to(torch.int8), scale
-
+    return q, scale
 
 
 class Model(nn.Module):
@@ -329,16 +332,17 @@ class Model(nn.Module):
 
         # Compute integer logits: shape [N, C]
         # Use int32 to avoid overflow when summing products of int8 values.
-        logits_fp = torch.matmul(
-        enc_q.to(torch.float32),          # [N, D]
-        w_q.t().to(torch.float32)         # [D, C]
-    )
+        logits_int = torch.matmul(
+            enc_q.to(torch.int32),           # [N, D]
+            w_q.t().to(torch.int32)         # [D, C]
+        )
 
         # Total real scale factor for dot-product scores
         full_scale = enc_scale * w_scale  # scalar
 
         # Convert back to float for the rest of the pipeline
-        logits = logits_fp.to(enc.dtype) * full_scale
+        logits = logits_int.to(enc.dtype) * full_scale
+
         return logits
 
     # ----------------------------------------------------------------------

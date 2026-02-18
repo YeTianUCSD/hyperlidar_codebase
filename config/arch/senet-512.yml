@@ -10,6 +10,9 @@ train:
   scheduler: "consine"  # "consine" or "decay"
   max_epochs: 1000000000
   hd_retrain_epochs: 1000000000
+  hd_quant_mode: "float"   # "float" or "nbit"
+  hd_quant_bits: 6         # only used when hd_quant_mode="nbit" (2/4/6/8)
+
   consine:
     min_lr: 0.0001
     max_lr: 0.01
