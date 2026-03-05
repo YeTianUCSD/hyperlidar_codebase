@@ -71,8 +71,8 @@ def _apply_online_overrides(ARCH: dict, flags):
     if mode not in ("float", "nbit"):
         print(f"[ERROR] hd_quant_mode must be 'float' or 'nbit', got {mode}")
         sys.exit(1)
-    if bits < 2 or bits > 8:
-        print(f"[ERROR] hd_quant_bits must be in [2,8], got {bits}")
+    if bits < 1 or bits > 8:
+        print(f"[ERROR] hd_quant_bits must be in [1,8], got {bits}")
         sys.exit(1)
 
     # Online source prototype path override.
@@ -139,7 +139,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--hd_mode", type=str, default=None, choices=["float", "nbit"],
                         help="HD mode: float or nbit (for final quantized eval)")
-    parser.add_argument("--hd_bits", type=int, default=None, choices=[2, 4, 6, 8],
+    parser.add_argument("--hd_bits", type=int, default=None, choices=[1, 2, 4, 6, 8],
                         help="HD quant bits when hd_mode=nbit")
 
     FLAGS, unknown = parser.parse_known_args()

@@ -66,7 +66,7 @@ def _apply_hd_overrides(ARCH: dict, flags):
     """
     Apply CLI overrides to ARCH so that modules/Basic_HD.py and modules/HDC_utils.py can read:
       ARCH["train"]["hd_quant_mode"]  in {"float","nbit"}
-      ARCH["train"]["hd_quant_bits"]  in {2,4,6,8}  (int8-backed)
+      ARCH["train"]["hd_quant_bits"]  in {1,2,4,6,8}  (int8-backed)
     """
     if ARCH is None:
         raise RuntimeError("ARCH yaml parsed to None (empty file?)")
@@ -91,8 +91,8 @@ def _apply_hd_overrides(ARCH: dict, flags):
 
     # Safety: int8 storage => bits must be <= 8
     bits = int(ARCH["train"]["hd_quant_bits"])
-    if bits < 2 or bits > 8:
-        print(f"[ERROR] hd_quant_bits must be in [2,8] for int8-backed quantization, got {bits}")
+    if bits < 1 or bits > 8:
+        print(f"[ERROR] hd_quant_bits must be in [1,8] for int8-backed quantization, got {bits}")
         sys.exit(1)
 
     mode = str(ARCH["train"]["hd_quant_mode"]).lower()
@@ -133,8 +133,8 @@ if __name__ == '__main__':
     # NEW: HD quant switches
     parser.add_argument('--hd_mode', type=str, default=None, choices=['float', 'nbit'],
                         help='HD mode: float (skip quantization + quantized eval) or nbit (quantized).')
-    parser.add_argument('--hd_bits', type=int, default=None, choices=[2, 4, 6, 8],
-                        help='HD quant bits for nbit mode (2/4/6/8). If set without --hd_mode, defaults to nbit.')
+    parser.add_argument('--hd_bits', type=int, default=None, choices=[1, 2, 4, 6, 8],
+                        help='HD quant bits for nbit mode (1/2/4/6/8). If set without --hd_mode, defaults to nbit.')
 
     FLAGS, unknown = parser.parse_known_args()
     if unknown:

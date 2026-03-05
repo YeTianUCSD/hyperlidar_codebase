@@ -47,7 +47,8 @@ if __name__ == '__main__':
         '--data_cfg', '-dc',
         type=str,
         required=False,
-        default='config/labels/semantic-kitti.yaml',
+        # default='config/labels/semantic-kitti.yaml',
+        default='config/labels/semantic-nuscenes_pretrainCNN_full.yaml',
         help='Classification yaml cfg file. See /config/labels for sample. No default!',
     )
     parser.add_argument(

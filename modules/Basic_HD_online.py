@@ -13,7 +13,7 @@ from modules.ioueval import iouEval
 
 
 def quantize_signed_nbit(x: torch.Tensor, n_bits: int = 6, eps: float = 1e-8):
-    assert 2 <= n_bits <= 8, f"n_bits must be in [2,8], got {n_bits}"
+    assert 1 <= n_bits <= 8, f"n_bits must be in [1,8], got {n_bits}"
     levels = 1 << (n_bits - 1)
     alpha = x.abs().max().clamp_min(eps)
     scale = alpha / float(levels)
@@ -413,10 +413,13 @@ class BasicHDOnline:
     # ------------------------------
     def _predict_logits(self, proj_in):
         samples_hv, _, _ = self.model.encode(proj_in, self.mask)
-        logits_s = self.model.get_predictions(samples_hv, use_quantized=False)
+        hv_for_logits = samples_hv
+        if not torch.is_floating_point(hv_for_logits):
+            hv_for_logits = hv_for_logits.to(self.classify_weights_raw.dtype)
+        logits_s = self.model.get_predictions(hv_for_logits, use_quantized=False)
         if self.use_teacher:
-            w_t = self._normalize_rows(self.teacher_weights_raw).to(samples_hv.dtype)
-            logits_t = torch.matmul(samples_hv, w_t.t())
+            w_t = self._normalize_rows(self.teacher_weights_raw).to(hv_for_logits.dtype)
+            logits_t = torch.matmul(hv_for_logits, w_t.t())
         else:
             logits_t = logits_s
         return samples_hv, logits_s, logits_t
@@ -906,11 +909,8 @@ class BasicHDOnline:
 
                 start = time.time()
 
-                if not use_quantized:
-                    pred_logits, _, _, _ = self.model(proj_in, self.mask)
-                else:
-                    hv, _, _ = self.model.encode(proj_in, self.mask)
-                    pred_logits = self.model.get_predictions(hv, use_quantized=True)
+                hv, _, _ = self.model.encode(proj_in, self.mask)
+                pred_logits = self.model.get_predictions(hv, use_quantized=bool(use_quantized))
 
                 pred_logits = pred_logits.view(B, H, W, self.num_classes)
                 pred_logits = pred_logits.permute(0, 3, 1, 2)

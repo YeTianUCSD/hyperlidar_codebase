@@ -21,7 +21,7 @@ def quantize_signed_nbit(x: torch.Tensor, n_bits: int = 6, eps: float = 1e-8):
     NOTE: This is not two's-complement 4-bit representable set (since +8 exists),
           but it's fine since we store in int8 and enforce the range logically.
     """
-    assert 2 <= n_bits <= 8, f"n_bits must be in [2,8], got {n_bits}"
+    assert 1 <= n_bits <= 8, f"n_bits must be in [1,8], got {n_bits}"
 
     levels = 1 << (n_bits - 1)  # 4->8, 6->32
     alpha = x.abs().max().clamp_min(eps)
@@ -64,6 +64,13 @@ class Model(nn.Module):
         # You can set ARCH["train"]["hd_quant_bits"] in YAML, e.g., 8 / 6 / 4 / 2
         self.hd_nbits = int(self.ARCH.get("train", {}).get("hd_quant_bits", 4))
         print(f"[HD-Model] Using {self.hd_nbits}-bit quantization inside Model.")
+        # Memory controls for large-frame HD encoding.
+        self.encode_chunk_size = int(self.ARCH.get("train", {}).get("hd_encode_chunk_size", 2048))
+        self.encode_store_int8 = bool(self.ARCH.get("train", {}).get("hd_encode_store_int8", True))
+        print(
+            f"[HD-Model] encode_chunk_size={self.encode_chunk_size}, "
+            f"encode_store_int8={self.encode_store_int8}"
+        )
 
         # ------------------------------------------------------------------
         # Load CNN backbone
@@ -214,33 +221,66 @@ class Model(nn.Module):
             # Use all positions
             selected_indices = torch.arange(x.shape[0], device=x.device)
 
-        # Allocate tensor for hypervectors
-        sample_hv = torch.zeros((x.shape[0], self.hd_dim),
-                                device=self.device, dtype=x.dtype)
+        # ------------------------------------------------------------------
+        # HD encoding (chunked for memory safety on large N)
+        # ------------------------------------------------------------------
+        n_points = x.shape[0]
+        out_dtype = torch.int8 if self.encode_store_int8 else x.dtype
+        sample_hv = torch.empty((n_points, self.hd_dim), device=self.device, dtype=out_dtype)
+        need_frame_avg = (PERCENTAGE is None)
+        frame_sum_hv = None
+        if need_frame_avg:
+            frame_sum_hv = torch.zeros((1, self.hd_dim), device=self.device, dtype=torch.float32)
 
-        # ------------------------------------------------------------------
-        # HD encoding
-        # ------------------------------------------------------------------
         if self.hd_encoder == 'rp':
             if x.dtype != self.projection.weight.dtype:
                 self.projection = self.projection.to(x.dtype).to(self.device)
-            sample_hv[:, mask] = self.projection(x)[:, mask]
+
+            chunk = max(1, int(self.encode_chunk_size))
+            for s in range(0, n_points, chunk):
+                e = min(s + chunk, n_points)
+                hv_chunk = self.projection(x[s:e])
+                hv_chunk = functional.hard_quantize(hv_chunk[:, mask])
+                if need_frame_avg:
+                    frame_sum_hv += hv_chunk.to(torch.float32).sum(dim=0, keepdim=True)
+                if self.encode_store_int8:
+                    sample_hv[s:e].fill_(1)
+                    sample_hv[s:e, mask] = hv_chunk.to(torch.int8)
+                else:
+                    sample_hv[s:e].zero_()
+                    sample_hv[s:e, mask] = hv_chunk
 
         elif self.hd_encoder == 'idlevel':
+            # Keep original path: idlevel bind/multiset is already expensive and
+            # less common in this repo's lidar setup.
+            sample_hv_fp = torch.zeros((n_points, self.hd_dim), device=self.device, dtype=x.dtype)
             tmp_hv = functional.bind(
                 self.position.weight[:, mask],
                 self.value(x)[:, :, mask]
             )  # [N, num_features, hd_dim]
-            sample_hv[:, mask] = functional.multiset(tmp_hv)  # [N, hd_dim]
+            sample_hv_fp[:, mask] = functional.multiset(tmp_hv)  # [N, hd_dim]
+            sample_hv_fp[:, mask] = functional.hard_quantize(sample_hv_fp[:, mask])
+            if need_frame_avg:
+                frame_sum_hv += sample_hv_fp.to(torch.float32).sum(dim=0, keepdim=True)
+            sample_hv = sample_hv_fp.to(torch.int8) if self.encode_store_int8 else sample_hv_fp
 
         elif self.hd_encoder == 'nonlinear':
-            sample_hv[:, mask] = self.nonlinear_projection(x)[:, mask]
+            chunk = max(1, int(self.encode_chunk_size))
+            for s in range(0, n_points, chunk):
+                e = min(s + chunk, n_points)
+                hv_chunk = self.nonlinear_projection(x[s:e])
+                hv_chunk = functional.hard_quantize(hv_chunk[:, mask])
+                if need_frame_avg:
+                    frame_sum_hv += hv_chunk.to(torch.float32).sum(dim=0, keepdim=True)
+                if self.encode_store_int8:
+                    sample_hv[s:e].fill_(1)
+                    sample_hv[s:e, mask] = hv_chunk.to(torch.int8)
+                else:
+                    sample_hv[s:e].zero_()
+                    sample_hv[s:e, mask] = hv_chunk
 
         else:  # No encoder, just return raw CNN features
             return x, selected_indices, is_wrong
-
-        # Binarize to bipolar hypervectors in {-1, +1}
-        sample_hv[:, mask] = functional.hard_quantize(sample_hv[:, mask])
         # sample_hv shape example: [B*H*W, hd_dim]
 
         # ------------------------------------------------------------------
@@ -253,7 +293,7 @@ class Model(nn.Module):
         if PERCENTAGE is None:
             # Compute frame-averaged HV over all positions in this batch
             # If batch size is 1 (typical), this gives [1, hd_dim].
-            frame_avg_hv = sample_hv.mean(dim=0, keepdim=True)  # [1, hd_dim]
+            frame_avg_hv = frame_sum_hv / float(max(1, n_points))  # [1, hd_dim]
 
             # n-bit quantization (e.g., 4/6/8-bit) using global hd_nbits
             frame_avg_hv_q, frame_avg_hv_scale = quantize_signed_nbit(
@@ -280,13 +320,16 @@ class Model(nn.Module):
 
         # Encode to HD space
         enc, indices, is_wrong_left = self.encode(x, mask, PERCENTAGE, is_wrong)
+        enc_for_cls = enc
+        if not torch.is_floating_point(enc_for_cls):
+            enc_for_cls = enc_for_cls.to(self.classify.weight.dtype)
 
         # Compute class scores (cosine-like) using float weights
-        if enc.dtype != self.classify.weight.dtype:
-            self.classify = self.classify.to(enc.dtype)
-        logits = self.classify(F.normalize(enc))
+        if enc_for_cls.dtype != self.classify.weight.dtype:
+            self.classify = self.classify.to(enc_for_cls.dtype)
+        logits = self.classify(F.normalize(enc_for_cls))
 
-        return logits, F.normalize(enc), indices, is_wrong_left
+        return logits, F.normalize(enc_for_cls), indices, is_wrong_left
 
     # ----------------------------------------------------------------------
     # Get predictions (supports float or quantized n-bit path)
@@ -306,10 +349,28 @@ class Model(nn.Module):
         """
         # 1) Fallback: original float path (used during training or if not quantized)
         if (not use_quantized) or (not hasattr(self, "classify_weights_q")):
-            # Compute cosine-distance-like scores: W * normalize(enc)^T
-            if enc.dtype != self.classify.weight.dtype:
-                self.classify = self.classify.to(enc.dtype)
-            logits = self.classify(F.normalize(enc))
+            # Fast path for float enc
+            if torch.is_floating_point(enc):
+                if enc.dtype != self.classify.weight.dtype:
+                    self.classify = self.classify.to(enc.dtype)
+                logits = self.classify(F.normalize(enc))
+                return logits
+
+            # Memory-safe path for int8 enc: compute logits chunk-by-chunk
+            w = self.classify.weight
+            if w.dtype != torch.float32:
+                w = w.to(torch.float32)
+            w_n = F.normalize(w, dim=1)  # [C, D]
+
+            n = enc.shape[0]
+            c = w_n.shape[0]
+            logits = torch.empty((n, c), device=enc.device, dtype=torch.float32)
+            chunk = max(1, int(self.encode_chunk_size))
+            for s in range(0, n, chunk):
+                e = min(s + chunk, n)
+                enc_chunk = enc[s:e].to(torch.float32)
+                enc_chunk = F.normalize(enc_chunk, dim=1)
+                logits[s:e] = torch.matmul(enc_chunk, w_n.t())
             return logits
 
         # 2) Quantized inference path: real n-bit (int8) dot-product
@@ -320,25 +381,49 @@ class Model(nn.Module):
         w_q = self.classify_weights_q          # int8, [C, D]
         w_scale = self.classify_weights_scale  # scalar float
 
-        # Normalize the input hypervectors to match the training behavior
-        enc_norm = F.normalize(enc)  # [N, D], float in roughly [-1, 1]
+        # Chunked quantized path to avoid OOM on large validation batches.
+        # 1) normalize in chunks and estimate a global quantization scale
+        # 2) quantize+matmul in chunks with that shared scale
+        n = enc.shape[0]
+        c = w_q.shape[0]
+        chunk = max(1, int(self.encode_chunk_size))
+        w_q_t = w_q.t().to(torch.float32)  # [D, C]
+        logits = torch.empty((n, c), device=enc.device, dtype=torch.float32)
 
-        # Quantize enc_norm to signed n-bit as well
-        # enc_q: int8 in [qmin, qmax], enc_scale: scalar float
-        enc_q, enc_scale = quantize_signed_nbit(enc_norm, n_bits=self.hd_nbits)
+        levels = 1 << (self.hd_nbits - 1)
+        eps = 1e-8
+        alpha = torch.tensor(0.0, device=enc.device, dtype=torch.float32)
 
-        # Compute integer logits: shape [N, C]
-        # Use int32 to avoid overflow when summing products of int8 values.
-        logits_fp = torch.matmul(
-        enc_q.to(torch.float32),          # [N, D]
-        w_q.t().to(torch.float32)         # [D, C]
-    )
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            enc_chunk = enc[s:e]
+            if not torch.is_floating_point(enc_chunk):
+                enc_chunk = enc_chunk.to(torch.float32)
+            enc_chunk = F.normalize(enc_chunk, dim=1)
+            alpha = torch.maximum(alpha, enc_chunk.abs().max())
 
-        # Total real scale factor for dot-product scores
-        full_scale = enc_scale * w_scale  # scalar
+        alpha = alpha.clamp_min(eps)
+        enc_scale = alpha / float(levels)
+        full_scale = enc_scale * w_scale
 
-        # Convert back to float for the rest of the pipeline
-        logits = logits_fp.to(enc.dtype) * full_scale
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            enc_chunk = enc[s:e]
+            if not torch.is_floating_point(enc_chunk):
+                enc_chunk = enc_chunk.to(torch.float32)
+            enc_chunk = F.normalize(enc_chunk, dim=1)
+
+            enc_q = torch.round(enc_chunk / enc_scale)
+            enc_q = torch.clamp(enc_q, -levels, levels)
+            enc_q = torch.where(
+                enc_q == 0,
+                torch.where(enc_chunk >= 0, torch.ones_like(enc_q), -torch.ones_like(enc_q)),
+                enc_q
+            )
+
+            logits_fp = torch.matmul(enc_q.to(torch.float32), w_q_t)
+            logits[s:e] = logits_fp * full_scale
+
         return logits
 
     # ----------------------------------------------------------------------
